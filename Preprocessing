@@ -1,1 +1,112 @@
+#%% Load and Inspect
+'''EDA Code Basic'''
+
+import pandas as pd
+
+# Load dataset
+df = pd.read_csv("Panel.csv")
+
+# Quick look
+print(df.shape)
+print(df.head())
+print(df.info())
+
+#%% Missing Values
+
+print(df.isnull().sum())
+
+
+print(df.isnull().mean() * 100)
+#%% Distribution of Shortages
+
+# Count shortages vs no shortages
+print(df["Shortage"].value_counts(normalize=True))
+
+# Bar plot
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.countplot(x="Shortage", data=df)
+plt.title("Distribution of Shortages")
+plt.show()
+
+#%% Correlation Analysis
+
+# Correlation matrix
+corr = df.corr(numeric_only=True)
+
+# Heatmap
+plt.figure(figsize=(12,8))
+sns.heatmap(corr, cmap="coolwarm", center=0, annot=False)
+plt.title("Correlation Matrix")
+plt.show()
+
+
+#%% Time Trends
+
+# Shortage frequency over years
+shortage_by_year = df.groupby("Year")["Shortage"].mean()
+
+plt.plot(shortage_by_year.index, shortage_by_year.values, marker="o")
+plt.title("Average Shortage Rate by Year")
+plt.xlabel("Year")
+plt.ylabel("Proportion of Shortages")
+plt.show()
+
+
+#%% Company-Level Patterns
+
+
+top_companies = df.groupby("Parent Company")["Shortage"].mean().sort_values(ascending=False).head(10)
+print(top_companies)
+
+# Plot
+top_companies.plot(kind="barh", title="Top Companies by Shortage Frequency")
+plt.show()
+
+
+#%% Summary Statiscs
+
+import pandas as pd
+
+# 
+df = pd.read_csv("Panel.csv") 
+
+
+summary = df.describe().T
+
+
+summary["range"] = summary["max"] - summary["min"]
+
+
+numeric_summary = summary.drop(columns=["count"])  # optional: remove count
+
+print(numeric_summary)
+
+# Save to CSV for easy inspection
+numeric_summary.to_csv("Summary_Statistics.csv")
+
+#%% Data Cleaning
+
+import pandas as pd
+
+
+df = pd.read_csv("Panel.csv")
+
+# Clean and standardize column names
+df.columns = (
+    df.columns
+    .str.strip()  # remove leading/trailing spaces
+    .str.replace(r'\s+', '_', regex=True)  # replace spaces with underscores
+    .str.replace(r'[%()]', '', regex=True)  # remove % and () symbols
+    .str.replace(r'[^0-9a-zA-Z_]', '', regex=True)  # remove any other weird characters
+)
+
+# Print cleaned column names
+print("Cleaned column names:")
+print(df.columns.tolist())
+
+
+df.to_csv("cleaned_dataset.csv", index=False)
+
 
