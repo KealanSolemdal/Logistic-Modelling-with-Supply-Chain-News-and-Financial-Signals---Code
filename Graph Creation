@@ -1,1 +1,359 @@
+# build_union_t1t3.py
+import re
+import math
+import unicodedata
+from collections import deque
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict
+
+import pandas as pd
+import networkx as nx
+
+
+
+WORKBOOKS: List[Tuple[str, str, Optional[str]]] = [
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\Alembic\1.xlsx", "Alembic Pharmaceuticals Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\amneal\1.xlsx", "Amneal Pharmaceuticals, Inc.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\amphastar\1.xlsx", "Amphastar Pharmaceuticals, Inc.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\aurobindo\1.xlsx", "Aurobindo Pharma Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\baxter\1.xlsx", "Baxter International Inc.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\caplin\1.xlsx", "Caplin Point Laboratories Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\drreddy\1.xlsx", "Dr. Reddy's Laboratories Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\eli\1.xlsx", "Eli Lilly and Company", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\fresenius\1.xlsx", "Fresenius SE & Co. KGaA", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\gland\1.xlsx", "Gland Pharma Limited", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\granuels\1.xlsx", "Granules India Ltd.", None),     # folder name 'granuels'
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\grifols\1.xlsx", "Grifols, S.A.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\hikma\1.xlsx", "Hikma Pharmaceuticals PLC", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\icu\1.xlsx", "ICU Medical, Inc.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\jiangsu\1.xlsx", "Jiangsu Hengrui Pharmaceuticals Co., Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\jonson\1.xlsx", "Johnson & Johnson", None),        # folder name 'jonson'
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\lupin\1.xlsx", "Lupin Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\novo\1.xlsx", "Novo Nordisk A/S", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\pfizer\1.xlsx", "Pfizer Inc.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\piramal\1.xlsx", "Piramal Enterprises Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\sandoz\1.xlsx", "Sandoz Group AG", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\shanghai\1.xlsx", "Shanghai Pharmaceuticals Holding Co., Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\sun\1.xlsx", "Sun Pharmaceutical Industries Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\takeda\1.xlsx", "Takeda Pharmaceutical Co., Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\teva\1.xlsx", "Teva Pharmaceutical Industries Ltd.", None),
+    (r"C:\Users\keala\Desktop\Dissertation_30\Supply Chain\viatris\1.xlsx", "Viatris Inc.", None),
+]
+
+
+
+
+
+OUT_STEM = "AllFocals_T1T3_Union"
+
+
+TIER_CUTOFF = 3
+
+
+_EXACT_SUP = {"current supplier"}
+_EXACT_PAR = {"supplier parent"}
+_EXACT_TIER = {"supplier tier"}
+
+
+_SUP_PAT  = re.compile(r"\bcurrent\s+suppliers?\b|\bsupplier\b", re.I)
+_PAR_PAT  = re.compile(r"\bsupplier\s+parent\b|\b(parent|subsidiary)\b", re.I)
+_TIER_PAT = re.compile(r"\bsupplier\s+tier\b|\btier\b", re.I)
+
+
+
+
+_WS_CHARS = {
+    "\u00A0",  # NBSP
+    "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005", "\u2006",
+    "\u2007", "\u2008", "\u2009", "\u200A",
+    "\u202F",  
+    "\u205F",
+    "\u3000",  
+}
+
+def _to_ascii_spaces(s: str) -> str:
+    s = unicodedata.normalize("NFKC", str(s))
+    for ch in _WS_CHARS:
+        s = s.replace(ch, " ")
+    return s
+
+def norm_ws_lower(s: str) -> str:
+    """Lowercase, trim, collapse whitespace."""
+    return re.sub(r"\s+", " ", str(s).strip().lower())
+
+def _norm_header(s: str) -> str:
+    """
+    Normalize column headers for robust matching:
+    - convert all unicode spaces to ' '
+    - lowercase
+    - remove decorations like '(Unique)', '(Invalid Identifier)', 'CIQ ID'
+    - strip remaining punctuation; collapse whitespace
+    """
+    s = _to_ascii_spaces(s).lower().strip()
+    s = re.sub(r"\s*\(.*?\)\s*$", "", s)    
+    s = re.sub(r"\s*ciq\s*id\s*$", "", s)    
+    s = re.sub(r"[^\w\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _clean_str(x) -> str:
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return ""
+    return str(x).strip()
+
+def _is_bad(x) -> bool:
+    if x is None: return True
+    if isinstance(x, float) and math.isnan(x): return True
+    s = str(x).strip().lower()
+    return s in {"", "nan", "none", "invalid identifier", "current suppliers", "current supplier"}
+
+
+def pick_supplier_parent_tier(cols: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    # map original -> normalized
+    norm_map = {c: _norm_header(c) for c in cols}
+    # invert to normalized -> list[originals]
+    inv: Dict[str, List[str]] = {}
+    for c, nc in norm_map.items():
+        inv.setdefault(nc, []).append(c)
+
+
+    sup_col = next((inv[nc][0] for nc in _EXACT_SUP if nc in inv), None)
+    par_col = next((inv[nc][0] for nc in _EXACT_PAR if nc in inv), None)
+    tier_col = next((inv[nc][0] for nc in _EXACT_TIER if nc in inv), None)
+
+    if sup_col and par_col:
+        return sup_col, par_col, tier_col
+
+
+    def _score_supplier_col(nc: str) -> int:
+        if not _SUP_PAT.search(nc): return -999
+        if any(w in nc for w in ["parent", "subsidiary", "id", "unique", "visited", "customer"]):
+            return -50
+        score = 0
+        if nc.startswith("current supplier"): score += 10
+        if "current" in nc: score += 3
+        if nc == "supplier": score += 2
+        score += max(0, 30 - len(nc))
+        return score
+
+    def _score_parent_col(nc: str) -> int:
+        if not _PAR_PAT.search(nc): return -999
+        if "customer" in nc: return -999
+        score = 0
+        if "supplier parent" in nc: score += 8
+        if "parent" in nc: score += 4
+        if "subsidiary" in nc: score += 2
+        if "name" in nc: score += 1
+        score += max(0, 30 - len(nc))
+        return score
+
+    def _score_tier_col(nc: str) -> int:
+        if not _TIER_PAT.search(nc): return -999
+        score = 0
+        if "supplier" in nc: score += 2
+        score += max(0, 30 - len(nc))
+        return score
+
+    best_sup_i = best_par_i = best_tier_i = None
+    best_sup_s = best_par_s = best_tier_s = -999
+
+    ncols = [norm_map[c] for c in cols]
+    for i, nc in enumerate(ncols):
+        s_sup, s_par, s_tier = _score_supplier_col(nc), _score_parent_col(nc), _score_tier_col(nc)
+        if s_sup  > best_sup_s:  best_sup_s,  best_sup_i  = s_sup,  i
+        if s_par  > best_par_s:  best_par_s,  best_par_i  = s_par,  i
+        if s_tier > best_tier_s: best_tier_s, best_tier_i = s_tier, i
+
+    sup_col  = sup_col  or (cols[best_sup_i]  if best_sup_i  is not None and best_sup_s  > -999 else None)
+    par_col  = par_col  or (cols[best_par_i]  if best_par_i  is not None and best_par_s  > -999 else None)
+    tier_col = tier_col or (cols[best_tier_i] if best_tier_i is not None and best_tier_s > -999 else None)
+
+    return sup_col, par_col, tier_col
+# ------------------------------------------
+
+
+def _read_first_sheet(path: str, sheet: Optional[str]) -> pd.DataFrame:
+    """Read the requested sheet or the first sheet if sheet is None."""
+    if sheet is None:
+        xl = pd.ExcelFile(path, engine="openpyxl")
+        sheet = xl.sheet_names[0]
+        df = xl.parse(sheet)
+    else:
+        df = pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+    return df
+
+
+def load_edges_from_workbook(path: str,
+                             focal: str,
+                             sheet: Optional[str]) -> Tuple[pd.DataFrame, str, str, Optional[str]]:
+    """
+    Load one workbook and return a cleaned dataframe plus the picked column names.
+    """
+    print(f"\n[LOAD] {path} | focal='{focal}' | sheet=<{sheet or 'first'}>")
+    df = _read_first_sheet(path, sheet)
+
+    cols = list(df.columns)
+    sup_col, par_col, tier_col = pick_supplier_parent_tier(cols)
+
+    if not sup_col or not par_col:
+        print("[DEBUG] Could not find Supplier or Parent column.")
+        print("[DEBUG] Headers (original -> normalized, with codepoints):")
+        for c in cols:
+            cp = [hex(ord(ch)) for ch in str(c)]
+            print(f"   - {repr(c)}  ->  {_norm_header(c)}  |  {cp}")
+        raise ValueError(f"[{path}] Could not find Supplier or Parent column "
+                         f"(got sup='{sup_col}', par='{par_col}').")
+
+    # keep & clean
+    keep_cols = [sup_col, par_col] + ([tier_col] if tier_col else [])
+    df = df[keep_cols].copy()
+
+    for c in [sup_col, par_col]:
+        df[c] = df[c].map(_clean_str)
+    df = df[~df[sup_col].map(_is_bad)]
+    df = df[~df[par_col].map(_is_bad)]
+    df = df.drop_duplicates(subset=keep_cols, keep="first")
+
+
+    edge_rows = []
+    for _, r in df.iterrows():
+        parent = r[par_col]
+        supplier = r[sup_col]
+        if not parent or not supplier:
+            continue
+        t = r[tier_col] if (tier_col and (tier_col in r)) else None
+        edge_rows.append({"parent": parent, "supplier": supplier, "tier_from_sheet": t})
+
+    edf = pd.DataFrame(edge_rows)
+    print(f"[OK] Parsed edges: {len(edf)} from '{Path(path).name}' "
+          f"(sup='{sup_col}', par='{par_col}', tier='{tier_col}')")
+    return edf, sup_col, par_col, tier_col
+
+
+
+def _multi_source_bfs_lengths(G: nx.DiGraph, sources, cutoff: Optional[int] = None) -> Dict[str, int]:
+    """
+    Return shortest path lengths from any of the sources using BFS over successors().
+    Works on all NetworkX versions.
+    """
+    dist: Dict[str, int] = {}
+    dq = deque()
+    for s in sources:
+        if s in G:
+            dist[s] = 0
+            dq.append(s)
+    while dq:
+        u = dq.popleft()
+        du = dist[u]
+        if cutoff is not None and du >= cutoff:
+            continue
+        for v in G.successors(u):  # Parent -> Supplier direction
+            if v not in dist:
+                dist[v] = du + 1
+                dq.append(v)
+    return dist
+
+
+
+def build_union_graph(workbooks: List[Tuple[str, str, Optional[str]]]) -> nx.DiGraph:
+    """
+    Build a union DiGraph with edges Parent -> Supplier across all workbooks.
+    """
+    G = nx.DiGraph()
+    focals: set[str] = set()
+
+    for path, focal, sheet in workbooks:
+        edf, _, _, _ = load_edges_from_workbook(path, focal, sheet)
+
+        # Add nodes and edges
+        for _, row in edf.iterrows():
+            par = row["parent"]
+            sup = row["supplier"]
+            t = row.get("tier_from_sheet")
+            if par not in G: G.add_node(par, name=par)
+            if sup not in G: G.add_node(sup, name=sup)
+            if not G.has_edge(par, sup):
+                G.add_edge(par, sup, tier_from_sheet=t)
+
+
+        focals.add(focal)
+        if focal not in G:
+            G.add_node(focal, name=focal)
+
+
+    nx.set_node_attributes(G, {f: {"node_type": "focal"} for f in focals})
+
+    print(f"[INFO] Union graph so far: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+    # Multi-source shortest path lengths from all focals (tiers)
+    dist: Dict[str, int] = _multi_source_bfs_lengths(G, sources=list(focals), cutoff=TIER_CUTOFF)
+
+    # Annotate tiers and node types
+    for n in G.nodes:
+        ct = dist.get(n, None)
+        G.nodes[n]["computed_tier"] = ct
+        if n not in focals:
+            G.nodes[n]["node_type"] = "supplier"
+
+    # Keep Tier 0..3 only (reachable within cutoff)
+    keep_nodes = {n for n, d in G.nodes(data=True)
+                  if d.get("computed_tier") is not None and d["computed_tier"] <= TIER_CUTOFF}
+    H = G.subgraph(keep_nodes).copy()
+    print(f"[INFO] T0–T{TIER_CUTOFF} subgraph: {H.number_of_nodes()} nodes, {H.number_of_edges()} edges")
+
+    # Sanitize attributes for export
+    for n, d in H.nodes(data=True):
+        ct = d.get("computed_tier")
+        d["computed_tier"] = int(ct) if ct is not None else -1
+        d["name"] = _clean_str(d.get("name") or n)
+        d["node_type"] = _clean_str(d.get("node_type") or "supplier")
+
+    for u, v, d in H.edges(data=True):
+        t = d.get("tier_from_sheet")
+        if t is None or (isinstance(t, float) and math.isnan(t)):
+            d["tier_from_sheet"] = ""
+        else:
+            try:
+                d["tier_from_sheet"] = int(t)
+            except Exception:
+                d["tier_from_sheet"] = _clean_str(t)
+
+    return H
+
+
+def export_graph(H: nx.DiGraph, out_stem: str) -> None:
+    # Nodes CSV
+    nodes_rows = []
+    for n, d in H.nodes(data=True):
+        nodes_rows.append({
+            "id": n,
+            "name": d.get("name", n),
+            "node_type": d.get("node_type"),
+            "computed_tier": d.get("computed_tier"),
+        })
+    pd.DataFrame(nodes_rows).to_csv(f"{out_stem}_nodes.csv", index=False)
+
+    # Edges CSV
+    edges_rows = []
+    for u, v, d in H.edges(data=True):
+        edges_rows.append({
+            "source": u,         # Parent
+            "target": v,         # Supplier
+            "tier_from_sheet": d.get("tier_from_sheet"),
+        })
+    pd.DataFrame(edges_rows).to_csv(f"{out_stem}_edges.csv", index=False)
+
+    # GEXF (for Gephi)
+    nx.write_gexf(H, f"{out_stem}.gexf")
+
+    print(f"[OK] Wrote {out_stem}_nodes.csv, {out_stem}_edges.csv, {out_stem}.gexf")
+
+
+def main():
+    H = build_union_graph(WORKBOOKS)
+    export_graph(H, OUT_STEM)
+
+
+if __name__ == "__main__":
+    main()
 
