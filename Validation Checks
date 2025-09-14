@@ -1,0 +1,142 @@
+
+
+
+# Validation & Robustness Checks for Logistic Model
+#   - Year sensitivity (with vs without Year)
+#   - Reverse-causality (lag news & financials by 1 year)
+#   - Outlier robustness (winsorize financials at 1%/99%)
+
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, brier_score_loss
+
+# ------------------ Load cleaned panel ------------------
+DATA = "panel_for_model.csv"   # <-- same file used earlier
+df = pd.read_csv(DATA)
+
+# Basic hygiene
+df = df.dropna(subset=["Shortage", "Year"]).copy()
+df["Year"] = df["Year"].astype(int)
+df["Shortage"] = df["Shortage"].astype(int)
+
+# ------------------ Feature groups (same names as before) ------------------
+complexity_cols = [
+    "Avg_Degree_T1", "Avg_Degree_T2", "Avg_Degree_T3",
+    "Betweenness_Centrality",
+    "Offshore_T1", "Offshore_T2", "Offshore_T3",
+]
+news_cols = ["AvgNews_T1", "AvgNews_T2", "AvgNews_T3"]
+financial_cols = ["Gross_Profit_Margin", "RD_Intensity",
+                  "Current_Ratio", "Firm_Size", "Debt_To_Equity"]
+
+# Keep only what exists
+complexity_cols = [c for c in complexity_cols if c in df.columns]
+news_cols       = [c for c in news_cols if c in df.columns]
+financial_cols  = [c for c in financial_cols if c in df.columns]
+
+# Our *baseline full* feature set for checks (M3 logic)
+FULL_WITH_YEAR = complexity_cols + news_cols + financial_cols + ["Year"]
+FULL_NO_YEAR   = complexity_cols + news_cols + financial_cols
+
+# ------------------ Train/test split by Year ------------------
+train_mask = (df["Year"] >= 2015) & (df["Year"] <= 2021)
+test_mask  = (df["Year"] >= 2022) & (df["Year"] <= 2025)
+
+train_df = df.loc[train_mask].copy()
+test_df  = df.loc[test_mask].copy()
+
+y_train = train_df["Shortage"].values
+y_test  = test_df["Shortage"].values
+
+# ------------------ Helpers: pipeline + evaluation ------------------
+def build_pipe(feat_list):
+    num = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+    ])
+    ct = ColumnTransformer(
+        transformers=[("num", num, feat_list)],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+    logit = LogisticRegression(
+        solver="saga", penalty="l2", class_weight="balanced",
+        max_iter=10000, n_jobs=-1, random_state=42
+    )
+    return Pipeline([("prep", ct), ("logit", logit)])
+
+def evaluate(name, feat_list, Xtr, ytr, Xte, yte, out):
+    pipe = build_pipe(feat_list)
+    pipe.fit(Xtr[feat_list], ytr)
+    p = pipe.predict_proba(Xte[feat_list])[:, 1]
+    auc = roc_auc_score(yte, p)
+    brier = brier_score_loss(yte, p)
+    out.append({"check": name, "AUC": auc, "Brier": brier, "n_test": len(yte)})
+    print(f"{name:35s}  AUC={auc:0.3f}  Brier={brier:0.3f}")
+    return p  # in case you want to keep the probabilities
+
+# ------------------ (1) Year sensitivity ------------------
+results = []
+_ = evaluate("Year sensitivity: WITH Year",
+             FULL_WITH_YEAR, train_df, y_train, test_df, y_test, results)
+_ = evaluate("Year sensitivity: NO Year",
+             FULL_NO_YEAR,   train_df, y_train, test_df, y_test, results)
+
+# ------------------ (2) Reverse-causality: lag features by 1y ------------------
+# Create lagged versions within each company–drug panel
+id_cols = [c for c in ["Parent_Company", "Proprietary_Name"] if c in df.columns]
+if not id_cols:  # fallback if those columns are not present
+    id_cols = ["Parent_Company"] if "Parent_Company" in df.columns else []
+
+lag_df = df.sort_values(id_cols + ["Year"]) if id_cols else df.sort_values(["Year"]).copy()
+for col in news_cols + financial_cols:
+    lag_df[f"L1_{col}"] = lag_df.groupby(id_cols)[col].shift(1) if id_cols else lag_df[col].shift(1)
+
+# Use lagged variables instead of contemporaneous ones
+lag_news_cols = [f"L1_{c}" for c in news_cols]
+lag_fin_cols  = [f"L1_{c}" for c in financial_cols]
+
+# Align splits
+lag_train = lag_df.loc[train_mask].copy()
+lag_test  = lag_df.loc[test_mask].copy()
+y_train_l = lag_train["Shortage"].values
+y_test_l  = lag_test["Shortage"].values
+
+LAG_FEATURES = complexity_cols + lag_news_cols + lag_fin_cols + ["Year"]
+# Evaluate (median imputer will handle first-year NaNs after lagging)
+_ = evaluate("Reverse-causality: lag news & fin (1y)",
+             LAG_FEATURES, lag_train, y_train_l, lag_test, y_test_l, results)
+
+# ------------------ (3) Outlier robustness: winsorise financials 1%/99% ------------------
+def winsorise_fit_transform(train, test, cols, lower=0.01, upper=0.99):
+    train = train.copy(); test = test.copy()
+    bounds = {}
+    for c in cols:
+        lo = train[c].quantile(lower)
+        hi = train[c].quantile(upper)
+        bounds[c] = (lo, hi)
+        train[c] = train[c].clip(lo, hi)
+        test[c]  = test[c].clip(lo, hi)
+    return train, test, bounds
+
+win_train, win_test, _ = winsorise_fit_transform(
+    train_df, test_df, financial_cols, lower=0.01, upper=0.99
+)
+
+_ = evaluate("Outlier robustness: winsorised fin (1%/99%)",
+             FULL_WITH_YEAR, win_train, y_train, win_test, y_test, results)
+
+# ------------------ Save summary ------------------
+Path("outputs_models").mkdir(exist_ok=True, parents=True)
+pd.DataFrame(results).to_csv("outputs_models/robustness_checks_summary.csv", index=False)
+print("\nSaved: outputs_models/robustness_checks_summary.csv")
+
+
