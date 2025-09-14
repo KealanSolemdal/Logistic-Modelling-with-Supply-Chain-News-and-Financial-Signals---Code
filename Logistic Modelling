@@ -1,1 +1,193 @@
 
+# Stepwise Logistic Regression (M1–M4)
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, brier_score_loss
+from sklearn.utils.class_weight import compute_class_weight
+
+import statsmodels.api as sm
+
+
+DATA = "panel_for_model.csv"
+df = pd.read_csv(DATA)
+
+# Keep only rows we can model on
+df = df.dropna(subset=["Shortage", "Year"]).copy()
+df["Year"] = df["Year"].astype(int)
+df["Shortage"] = df["Shortage"].astype(int)
+
+
+complexity_cols = [
+    "Avg_Degree_T1", "Avg_Degree_T2", "Avg_Degree_T3",
+    "Betweenness_Centrality",
+    "Offshore_T1", "Offshore_T2", "Offshore_T3",
+]
+
+
+news_cols = ["AvgNews_T1", "AvgNews_T2", "AvgNews_T3"]
+
+
+financial_cols = ["Gross_Profit_Margin", "RD_Intensity",
+                  "Current_Ratio", "Firm_Size", "Debt_To_Equity"]
+
+
+complexity_cols = [c for c in complexity_cols if c in df.columns]
+news_cols       = [c for c in news_cols if c in df.columns]
+financial_cols  = [c for c in financial_cols if c in df.columns]
+
+
+def zscore(s): 
+    return (s - s.mean()) / (s.std(ddof=0) + 1e-9)
+
+
+comp_parts = []
+for c in complexity_cols:
+    sign = 1.0
+    if c in ["Avg_Degree_T3", "Offshore_T3"]:
+        sign = -1.0  
+    comp_parts.append(sign * zscore(df[c].fillna(df[c].median())))
+
+df["Comp_Index"] = np.sum(comp_parts, axis=0) if comp_parts else 0.0
+
+
+news_parts = [zscore(df[c].fillna(df[c].median())) for c in news_cols]
+df["News_Index"] = np.sum(news_parts, axis=0) if news_parts else 0.0
+
+
+fin_parts = []
+for c in financial_cols:
+    s = df[c].fillna(df[c].median())
+    if c == "Debt_To_Equity":
+        s = -s  # lower leverage => stronger
+    fin_parts.append(zscore(s))
+df["Fin_Index"] = np.sum(fin_parts, axis=0) if fin_parts else 0.0
+
+# Interactions (only used in M4)
+df["Comp_x_News"] = df["Comp_Index"] * df["News_Index"]
+df["Comp_x_Fin"]  = df["Comp_Index"] * df["Fin_Index"]
+
+
+base_year = ["Year"]
+
+M1_feats = complexity_cols + base_year
+M2_feats = complexity_cols + news_cols + base_year
+M3_feats = complexity_cols + news_cols + financial_cols + base_year
+M4_feats = M3_feats + ["Comp_x_News", "Comp_x_Fin"]
+
+models = {
+    "M1_complexity+Year": M1_feats,
+    "M2_comp+news+Year":  M2_feats,
+    "M3_full+Year":       M3_feats,
+    "M4_full+ints+Year":  M4_feats,
+}
+
+
+train_mask = (df["Year"] >= 2015) & (df["Year"] <= 2021)
+test_mask  = (df["Year"] >= 2022) & (df["Year"] <= 2025)
+
+train_df = df.loc[train_mask].copy()
+test_df  = df.loc[test_mask].copy()
+
+y_train = train_df["Shortage"].astype(int).values
+y_test  = test_df["Shortage"].astype(int).values
+
+
+def build_pipeline(feature_list):
+    """
+    Median imputation + standardisation + class-weighted logistic (SAGA).
+    """
+    X_cols = feature_list
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+    ])
+    preproc = ColumnTransformer(
+        transformers=[("num", numeric_transformer, X_cols)],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+    clf = LogisticRegression(
+        solver="saga",
+        penalty="l2",
+        class_weight="balanced",
+        max_iter=10000,
+        random_state=42,
+        n_jobs=-1,
+    )
+    pipe = Pipeline(steps=[("prep", preproc), ("logit", clf)])
+    return pipe
+
+def odds_ratios_statsmodels(train_df, feature_list):
+    """
+    Refit with statsmodels (on the same preprocessed design)
+    to get ORs with 95% CI and p-values (for interpretability).
+    """
+
+    X = train_df[feature_list].copy()
+    X = X.fillna(X.median(numeric_only=True))
+    X = (X - X.mean()) / (X.std(ddof=0) + 1e-9)
+
+    X = sm.add_constant(X)  # intercept
+    y = train_df["Shortage"].astype(int).values
+
+    model = sm.Logit(y, X, missing="raise")
+    res = model.fit(disp=False, maxiter=1000)
+
+    coefs = res.params
+    conf  = res.conf_int()
+    or_df = pd.DataFrame({
+        "feature": coefs.index,
+        "coef":    coefs.values,
+        "OR":      np.exp(coefs.values),
+        "CI_low":  np.exp(conf[0].values),
+        "CI_high": np.exp(conf[1].values),
+        "p_value": res.pvalues.values,
+    })
+
+    or_df = or_df.loc[or_df["feature"] != "const"].reset_index(drop=True)
+    return or_df
+
+def evaluate_and_save(name, feature_list, outdir="outputs_models"):
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+
+
+    pipe = build_pipeline(feature_list)
+    pipe.fit(train_df[feature_list], y_train)
+
+
+    proba_test = pipe.predict_proba(test_df[feature_list])[:, 1]
+
+    auc  = roc_auc_score(y_test, proba_test)
+    brier = brier_score_loss(y_test, proba_test)
+
+    print(f"\n{name}")
+    print(f"  Features: {len(feature_list)}")
+    print(f"  Test AUC  : {auc:0.3f}")
+    print(f"  Brier     : {brier:0.3f}")
+
+    # Save predictions
+    preds = test_df[["Parent_Company","Proprietary_Name","Year","Shortage"]].copy()
+    preds[f"Pred_Prob_{name}"] = proba_test
+    preds.to_csv(Path(outdir, f"preds_{name}.csv"), index=False)
+
+
+    try:
+        or_df = odds_ratios_statsmodels(train_df, feature_list)
+        or_df.to_csv(Path(outdir, f"odds_ratios_{name}.csv"), index=False)
+    except Exception as e:
+        print(f"  (OR export skipped: {e})")
+
+
+for model_name, feats in models.items():
+    evaluate_and_save(model_name, feats)
+
+print("\nDone. Files written to: outputs_models/")
+
